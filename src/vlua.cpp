@@ -58,7 +58,9 @@ static const int open_debug = 0;
 static void vlog(const char *header, const char *file, const char *func, int pos,
                  const char *fmt, ...) {
     FILE *pLog = fopen("vlua.log", "a+");
-    if (pLog == NULL) return;
+    if (pLog == NULL) {
+        return;
+    }
 
     time_t clock1 = time(0);
     struct tm *tptr = localtime(&clock1);
@@ -146,11 +148,15 @@ static std::string g_filename;
 // 通过 dlsym 查符号（只能找到 DYNAMIC 段里的导出符号）
 static int resolve_symbol_dlsym(const char *name, uintptr_t *out_addr, size_t *out_size) {
     void *addr = dlsym(RTLD_DEFAULT, name);
-    if (!addr) return -1;
+    if (!addr) {
+        return -1;
+    }
 
     Dl_info info;
     ElfW(Sym) *sym = NULL;
-    if (dladdr1(addr, &info, (void**)&sym, RTLD_DL_SYMENT) == 0 || !sym) return -1;
+    if (dladdr1(addr, &info, (void**)&sym, RTLD_DL_SYMENT) == 0 || !sym) {
+        return -1;
+    }
 
     *out_addr = (uintptr_t) addr;
     *out_size = (size_t) sym->st_size;
@@ -174,18 +180,28 @@ struct SymtabSearchCtx {
 static int search_symtab_in_file(const char *path, uintptr_t load_base,
                                  SymtabSearchCtx *ctx) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        return -1;
+    }
 
     struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
 
     void *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (map == MAP_FAILED) return -1;
+    if (map == MAP_FAILED) {
+        return -1;
+    }
 
     const uint8_t *base = (const uint8_t *) map;
     const ElfW(Ehdr) *eh = (const ElfW(Ehdr) *) base;
-    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) { munmap(map, st.st_size); return -1; }
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) {
+        munmap(map, st.st_size);
+        return -1;
+    }
 
     const ElfW(Shdr) *sh = (const ElfW(Shdr) *) (base + eh->e_shoff);
     const ElfW(Shdr) *symtab = NULL;
@@ -194,7 +210,9 @@ static int search_symtab_in_file(const char *path, uintptr_t load_base,
     for (int i = 0; i < eh->e_shnum; i++) {
         if (sh[i].sh_type == SHT_SYMTAB) {
             symtab = &sh[i];
-            if (sh[i].sh_link < eh->e_shnum) strtab = &sh[sh[i].sh_link];
+            if (sh[i].sh_link < eh->e_shnum) {
+                strtab = &sh[sh[i].sh_link];
+            }
             break;
         }
     }
@@ -207,14 +225,20 @@ static int search_symtab_in_file(const char *path, uintptr_t load_base,
 
         for (size_t i = 0; i < n; i++) {
             const ElfW(Sym) *s = &syms[i];
-            if (ELF64_ST_TYPE(s->st_info) != STT_FUNC) continue;
-            if (s->st_size == 0) continue;
+            if (ELF64_ST_TYPE(s->st_info) != STT_FUNC) {
+                continue;
+            }
+            if (s->st_size == 0) {
+                continue;
+            }
             const char *sn = strs + s->st_name;
             if (strcmp(sn, ctx->name) == 0) {
                 // 对于可执行文件（ET_EXEC），st_value 是绝对地址，load_base 通常 0
                 // 对于 PIE/共享库（ET_DYN），需要加上 load_base
                 uintptr_t addr = (uintptr_t) s->st_value;
-                if (eh->e_type == ET_DYN) addr += load_base;
+                if (eh->e_type == ET_DYN) {
+                    addr += load_base;
+                }
                 ctx->found_addr = addr;
                 ctx->found_size = s->st_size;
                 ctx->found = 1;
@@ -231,7 +255,9 @@ static int search_symtab_in_file(const char *path, uintptr_t load_base,
 static int dl_iter_cb(struct dl_phdr_info *info, size_t sz, void *data) {
     (void) sz;
     SymtabSearchCtx *ctx = (SymtabSearchCtx *) data;
-    if (ctx->found) return 1;
+    if (ctx->found) {
+        return 1;
+    }
 
     const char *path = info->dlpi_name;
     // 主程序 dlpi_name 通常为 ""，需要替换成 /proc/self/exe
@@ -253,7 +279,9 @@ static int resolve_symbol_symtab(const char *name, uintptr_t *out_addr, size_t *
     ctx.found_addr = 0;
     ctx.found_size = 0;
     dl_iterate_phdr(dl_iter_cb, &ctx);
-    if (!ctx.found) return -1;
+    if (!ctx.found) {
+        return -1;
+    }
     *out_addr = ctx.found_addr;
     *out_size = ctx.found_size;
     return 0;
@@ -297,7 +325,9 @@ static void segv_handler(int sig, siginfo_t *si, void *ucontext) {
     // 不是 vlua 触发的 SEGV，转发给原 handler
     struct sigaction *prev = (sig == SIGBUS) ? &g_prev_sigbus : &g_prev_sigsegv;
     if (prev->sa_flags & SA_SIGINFO) {
-        if (prev->sa_sigaction) prev->sa_sigaction(sig, si, ucontext);
+        if (prev->sa_sigaction) {
+            prev->sa_sigaction(sig, si, ucontext);
+        }
     } else {
         if (prev->sa_handler == SIG_DFL) {
             // 恢复默认行为并重新触发（让进程该崩就崩）
@@ -356,16 +386,22 @@ static void signal_handler(int sig, siginfo_t *si, void *ucontext) {
 
     g_sample_total_tick++;
 
-    if (!g_running) return;
+    if (!g_running) {
+        return;
+    }
 
     ucontext_t *uc = (ucontext_t *) ucontext;
     uintptr_t pc = get_pc_from_ucontext(uc);
 
     // 绝大多数 SIGPROF 到这里就 return，开销极低
-    if (pc < g_target_addr || pc >= g_target_end) return;
+    if (pc < g_target_addr || pc >= g_target_end) {
+        return;
+    }
 
     lua_State *L = g_L;
-    if (!L) return;
+    if (!L) {
+        return;
+    }
 
     // ---- 架起 SEGV 安全网：下面所有 deref 如果挂了会跳回这里 ----
     if (sigsetjmp(tl_segv_jmp, 1) != 0) {
@@ -437,7 +473,9 @@ static void signal_handler(int sig, siginfo_t *si, void *ucontext) {
         for (size_t i = 0; i < n; i++) {
             char c = src[i];
             src_buf[i] = c;
-            if (c == 0) break;
+            if (c == 0) {
+                break;
+            }
         }
         src_buf[SAMPLE_SRC_MAX] = 0;
     }
@@ -572,7 +610,9 @@ static void resolve_and_report() {
 
     for (uint64_t i = 0; i < to_scan; i++) {
         const Sample &s = g_samples[i];
-        if (s.source[0] == 0 && s.line <= 0) continue;  // 空槽
+        if (s.source[0] == 0 && s.line <= 0) {
+            continue;  // 空槽
+        }
 
         // 行级 key
         snprintf(keybuf, sizeof(keybuf), "%s:%d", s.source, s.line);
@@ -605,13 +645,17 @@ static void resolve_and_report() {
     // 排序：按 count 降序
     std::vector<LineAggregate> sorted_lines;
     sorted_lines.reserve(agg.size());
-    for (auto &kv : agg) sorted_lines.push_back(kv.second);
+    for (auto &kv : agg) {
+        sorted_lines.push_back(kv.second);
+    }
     std::sort(sorted_lines.begin(), sorted_lines.end(),
               [](const LineAggregate &a, const LineAggregate &b){ return a.count > b.count; });
 
     std::vector<FuncAggregate> sorted_funcs;
     sorted_funcs.reserve(func_agg.size());
-    for (auto &kv : func_agg) sorted_funcs.push_back(kv.second);
+    for (auto &kv : func_agg) {
+        sorted_funcs.push_back(kv.second);
+    }
     std::sort(sorted_funcs.begin(), sorted_funcs.end(),
               [](const FuncAggregate &a, const FuncAggregate &b){ return a.count > b.count; });
 
@@ -620,9 +664,13 @@ static void resolve_and_report() {
     auto sanitize = [](const std::string &in) -> std::string {
         std::string s = in;
         for (char &c : s) {
-            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            if (c == '\n' || c == '\r' || c == '\t') {
+                c = ' ';
+            }
         }
-        if (s.size() > 80) s = s.substr(0, 77) + "...";
+        if (s.size() > 80) {
+            s = s.substr(0, 77) + "...";
+        }
         return s;
     };
 
@@ -635,7 +683,9 @@ static void resolve_and_report() {
     }
 
     uint64_t analysable = 0;
-    for (auto &kv : agg) analysable += kv.second.count;
+    for (auto &kv : agg) {
+        analysable += kv.second.count;
+    }
 
     fprintf(fp, "====================  vLua sampling report  ====================\n");
     fprintf(fp, "target function   : %s\n", g_target_name.c_str());
