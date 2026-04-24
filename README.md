@@ -38,18 +38,6 @@ local text = v.stop()
 print(text)
 ```
 
-或者用 [hookso](https://github.com/esrrhs/hookso) 注入：
-```shell
-# 获取 lua_State 指针
-./hookso arg $PID xxx.so lua_settop 1
-# 加载 libvlua.so
-./hookso dlopen $PID ./libvlua.so
-# 开启采样
-./hookso call $PID libvlua.so lrealstart i=$L s="luaH_getshortstr" s="./call.pro"
-# 关闭采样
-./hookso call $PID libvlua.so lrealstop i=$L
-```
-
 ## 生成可视化结果
 ```shell
 cd tools
