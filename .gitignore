@@ -35,6 +35,10 @@ src/lzio.h
 # sampling reports produced by tests
 test/*.pro
 
+# go build output in tools/
+tools/vlua
+tools/png
+
 # misc
 *.log
 *.o

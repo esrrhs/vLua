@@ -25,3 +25,11 @@ fi
 
 cmake ../
 make
+
+cd $projectdir/tools
+GO111MODULE=off go build vlua.go
+GO111MODULE=off go build png.go
+
+chmod a+x pprof
+chmod a+x *.pl
+chmod a+x *.sh
