@@ -264,7 +264,10 @@ static int dl_iter_cb(struct dl_phdr_info *info, size_t sz, void *data) {
     char buf[1024];
     if (!path || !*path) {
         ssize_t r = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (r > 0) { buf[r] = 0; path = buf; }
+        if (r > 0) {
+            buf[r] = 0;
+            path = buf;
+        }
         else return 0;
     }
 
@@ -412,36 +415,63 @@ static void signal_handler(int sig, siginfo_t *si, void *ucontext) {
     tl_segv_armed = 1;
 
     // ---- 校验 L 指针大致合法 ----
-    if (!ptr_aligned(L, 8)) { tl_segv_armed = 0; return; }
+    if (!ptr_aligned(L, 8)) {
+        tl_segv_armed = 0;
+        return;
+    }
 
     // 读 L->ci，找最近一个 Lua 帧
     CallInfo *ci = L->ci;
-    if (!ci || !ptr_aligned(ci, 8)) { tl_segv_armed = 0; return; }
+    if (!ci || !ptr_aligned(ci, 8)) {
+        tl_segv_armed = 0;
+        return;
+    }
 
     int hops = 0;
     while (ci && !ci_is_lua(ci) && hops < 8) {
         ci = ci->previous;
-        if (ci && !ptr_aligned(ci, 8)) { tl_segv_armed = 0; return; }
+        if (ci && !ptr_aligned(ci, 8)) {
+            tl_segv_armed = 0;
+            return;
+        }
         hops++;
     }
-    if (!ci || !ci_is_lua(ci)) { tl_segv_armed = 0; return; }
+    if (!ci || !ci_is_lua(ci)) {
+        tl_segv_armed = 0;
+        return;
+    }
 
     // ---- 校验 ci->func 落在 L->stack 范围内 ----
     StkId func = ci->func;
-    if (!func || !ptr_aligned(func, 8)) { tl_segv_armed = 0; return; }
+    if (!func || !ptr_aligned(func, 8)) {
+        tl_segv_armed = 0;
+        return;
+    }
     if (L->stack && L->stack_last) {
-        if (func < L->stack || func > L->stack_last) { tl_segv_armed = 0; return; }
+        if (func < L->stack || func > L->stack_last) {
+            tl_segv_armed = 0;
+            return;
+        }
     }
 
     // ---- 校验 func 是 Lua closure ----
-    if (!tvalue_is_lclosure(func)) { tl_segv_armed = 0; return; }
+    if (!tvalue_is_lclosure(func)) {
+        tl_segv_armed = 0;
+        return;
+    }
 
     const GCObject *gc = func->value_.gc;
-    if (!gc || !ptr_aligned(gc, 8)) { tl_segv_armed = 0; return; }
+    if (!gc || !ptr_aligned(gc, 8)) {
+        tl_segv_armed = 0;
+        return;
+    }
 
     const LClosure *cl = (const LClosure *) gc;
     const Proto *p = cl->p;
-    if (!p || !ptr_aligned(p, 8)) { tl_segv_armed = 0; return; }
+    if (!p || !ptr_aligned(p, 8)) {
+        tl_segv_armed = 0;
+        return;
+    }
 
     // ---- 访问 Proto 的字段 ----
     const Instruction *code = p->code;
