@@ -73,10 +73,6 @@ Top hotspots (source:line -> count, pct of analysable)
 - 热更期间可以常开，不会崩（三层防护：值类型 Sample + 指针校验 + SIGSEGV trampoline）
 - 当前假设单 Lua VM（`g_L`），多 lua_State 场景需要扩展
 
-## 和 pLua 的区别
+## 其他
+[lua全家桶](https://github.com/esrrhs/lua-family-bucket)
 
-|              | pLua                           | vLua                             |
-|--------------|--------------------------------|----------------------------------|
-| 定位         | Lua 函数级 CPU/内存 profiler   | C 函数级 PC 采样 + Lua 栈归因   |
-| 采样对象     | 所有 Lua 函数调用              | 指定的 VM 内部 C 函数            |
-| 适用场景     | "哪些 Lua 函数耗 CPU"          | "哪些 Lua 代码在触发特定 C 热点" |
