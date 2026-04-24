@@ -105,10 +105,14 @@ static const int MAX_STACK_DEPTH = 64;
 // 全局状态
 // ----------------------------------------------------------------------------
 
-// 一帧栈信息：文件名 + 行号（自包含，不持有 Lua 堆指针）
+// 一帧栈信息（自包含，不持有 Lua 堆指针）
+// name: 函数名，优先从上一帧的调用指令推导（类似 ar->name），
+//       拿不到则用 "function <source:linedefined>" 格式
+// line: 当前执行行号（savedpc 解析），用于文本报告的 top hotspots
 struct StackFrame {
-    char source[SAMPLE_SRC_MAX + 1];
-    int  line;
+    char name[SAMPLE_SRC_MAX + 1];   // 函数/帧显示名
+    char source[SAMPLE_SRC_MAX + 1]; // proto->source
+    int  line;                       // 当前执行行号
 };
 
 // 一次完整的采样：完整 Lua 调用栈（从栈底到栈顶）
@@ -388,9 +392,12 @@ static inline int ptr_aligned(const void *p, size_t align) {
 // luaH_getshortstr），说明当前线程正在 VM 调度中，L->ci 指向的 Lua
 // 帧对应的 closure/proto 在绝大多数情况下是 rooted 的——它就在 Lua 栈上。
 // 数据拷贝完成后就不再持有指针，后续报告阶段绝对安全。
-// 从一个 CallInfo 提取 source 和 line 到 StackFrame。
+// 从一个 CallInfo 提取帧信息到 StackFrame。
 // 返回 1 成功，0 失败（跳过该帧）。
-// 调用方保证 ci 非空、已过 isLua 检查。
+// 帧的 name 格式（同 pLua 的 get_funcname）：
+//   linedefined > 0  → "function <source:linedefined>"
+//   linedefined == 0 → "main chunk"
+// line 保存精确执行行号（用于文本报告的 top hotspots）。
 static inline int extract_frame(const CallInfo *ci, const lua_State *L, StackFrame *out) {
     StkId func = ci->func;
     if (!func || !ptr_aligned(func, 8)) {
@@ -416,7 +423,7 @@ static inline int extract_frame(const CallInfo *ci, const lua_State *L, StackFra
         return 0;
     }
 
-    // 解析行号
+    // 解析当前执行行号
     int line = -1;
     const Instruction *code = p->code;
     int sizecode = p->sizecode;
@@ -431,22 +438,34 @@ static inline int extract_frame(const CallInfo *ci, const lua_State *L, StackFra
             }
         }
     }
+    out->line = line;
 
     // 拷贝 source 字符串
-    out->source[0] = 0;
-    out->line = line;
+    char src_buf[SAMPLE_SRC_MAX + 1];
+    src_buf[0] = 0;
     TString *src_ts = p->source;
     if (src_ts && ptr_aligned(src_ts, 8)) {
         const char *src = (const char *) src_ts + sizeof(UTString);
         for (size_t i = 0; i < SAMPLE_SRC_MAX; i++) {
             char c = src[i];
-            out->source[i] = c;
+            src_buf[i] = c;
             if (c == 0) {
                 break;
             }
         }
-        out->source[SAMPLE_SRC_MAX] = 0;
+        src_buf[SAMPLE_SRC_MAX] = 0;
     }
+    memcpy(out->source, src_buf, sizeof(src_buf));
+
+    // 生成函数名（同 pLua 的 get_funcname fallback 格式）
+    int linedefined = p->linedefined;
+    if (linedefined == 0) {
+        snprintf(out->name, SAMPLE_SRC_MAX, "main chunk");
+    } else {
+        snprintf(out->name, SAMPLE_SRC_MAX, "function <%s:%d>", src_buf, linedefined);
+    }
+    out->name[SAMPLE_SRC_MAX] = 0;
+
     return 1;
 }
 
@@ -664,8 +683,13 @@ static std::string sanitize_source(const std::string &in) {
     return s;
 }
 
-// 为 StackFrame 生成显示名字：source:line
+// 为 StackFrame 生成 .pro 文件里的帧标识名：直接用预生成的 name 字段
 static std::string frame_name(const StackFrame &f) {
+    return sanitize_source(f.name);
+}
+
+// 为 StackFrame 生成精确行号标识（用于文本报告 top hotspots）
+static std::string frame_line_name(const StackFrame &f) {
     char buf[256];
     std::string src = sanitize_source(f.source);
     if (f.line > 0) {
@@ -764,8 +788,8 @@ static std::string build_text_report(
         if (s.depth <= 0) {
             continue;
         }
-        // 栈顶 = frames[depth-1]
-        std::string name = frame_name(s.frames[s.depth - 1]);
+        // 栈顶 = frames[depth-1]，文本报告用精确行号
+        std::string name = frame_line_name(s.frames[s.depth - 1]);
         top_agg[name]++;
     }
 
