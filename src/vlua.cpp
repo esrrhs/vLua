@@ -612,6 +612,65 @@ static int start_impl(lua_State *L, const char *func_name, const char *file) {
 // 报告聚合与输出
 // ----------------------------------------------------------------------------
 
+// pLua 兼容常量（与 plua.cpp / plua.go 一致）
+static const int PLUA_MAX_FUNC_NAME_SIZE = 127;
+static const int PLUA_MAX_STACK_SIZE = 64;
+
+// pLua 的 IGNORE_NAME 起始 ID 数量，vlua 不需要忽略名字，但 ID 从
+// VALID_MIN_ID 开始分配，保持和 pLua 工具链兼容。
+static const int VALID_MIN_ID = 9;
+
+struct CallStack {
+    int depth;
+    int stack[PLUA_MAX_STACK_SIZE];
+};
+
+struct CallStackHash {
+    size_t operator()(const CallStack &cs) const {
+        size_t hash = 0;
+        for (int i = 0; i < cs.depth; i++) {
+            int id = cs.stack[i];
+            hash = (hash << 8) | (hash >> (8 * (sizeof(hash) - 1)));
+            hash += (id * 31) + (id * 7) + (id * 3);
+        }
+        return hash;
+    }
+};
+
+struct CallStackEqual {
+    bool operator()(const CallStack &cs1, const CallStack &cs2) const {
+        if (cs1.depth != cs2.depth) {
+            return false;
+        }
+        return memcmp(cs1.stack, cs2.stack, sizeof(int) * cs1.depth) == 0;
+    }
+};
+
+static void flush_file(int fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t r = write(fd, buf, len);
+        if (r <= 0) {
+            break;
+        }
+        buf += r;
+        len -= r;
+    }
+}
+
+// 把 source 字符串单行化（load(str) 产生的 chunk source 含多行源码）
+static std::string sanitize_source(const std::string &in) {
+    std::string s = in;
+    for (char &c : s) {
+        if (c == '\n' || c == '\r' || c == '\t') {
+            c = ' ';
+        }
+    }
+    if (s.size() > 80) {
+        s = s.substr(0, 77) + "...";
+    }
+    return s;
+}
+
 struct LineAggregate {
     std::string source;
     int line;
@@ -625,17 +684,12 @@ struct FuncAggregate {
     uint64_t count;
 };
 
-// 把 ring buffer 里自包含的 Sample 聚合成报告。
-// 不访问任何 Lua 堆指针——即使 Proto 已经被 GC 回收也安全。
-static void resolve_and_report() {
-    uint64_t total_hit  = g_sample_hit_count;
-    uint64_t total_tick = g_sample_total_tick;
-    uint64_t written    = g_sample_write_idx;
-    uint64_t to_scan    = written < RING_BUFFER_SIZE ? written : RING_BUFFER_SIZE;
-
-    std::unordered_map<std::string, LineAggregate> agg;      // key: "source:line"
-    std::unordered_map<std::string, FuncAggregate> func_agg; // key: "source:linedefined"
-
+// 扫描 ring buffer，返回聚合后的数据
+static void scan_ring_buffer(
+    uint64_t to_scan,
+    std::unordered_map<std::string, LineAggregate> &agg,
+    std::unordered_map<std::string, FuncAggregate> &func_agg)
+{
     char keybuf[SAMPLE_SRC_MAX + 32];
 
     for (uint64_t i = 0; i < to_scan; i++) {
@@ -671,8 +725,113 @@ static void resolve_and_report() {
             fit->second.count++;
         }
     }
+}
 
-    // 排序：按 count 降序
+// 写 pLua 兼容的 .pro 二进制文件。
+// 格式（与 plua.cpp flush() 完全一致，plua.go 可直接解析）：
+//   [N 个 CallStack 条目]: count(int32) + CallStack{depth(int32) + stack[64](int32×64)}
+//   [M 个字符串条目]:      name(变长bytes) + name_len(int32) + id(int32)
+//   [尾部 4 字节]:          M(int32) = 字符串条目总数
+//
+// 每个采样点对应一个 depth=2 的 CallStack：
+//   stack[0] = 函数级 ID（"function <@file.lua:24>"）
+//   stack[1] = 行级 ID（"@file.lua:27"）
+static void flush_pro_file(
+    const std::unordered_map<std::string, LineAggregate> &agg,
+    const std::unordered_map<std::string, FuncAggregate> &func_agg)
+{
+    int fd = open(g_filename.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (fd < 0) {
+        VERR("open %s failed", g_filename.c_str());
+        return;
+    }
+
+    // 1. 为所有唯一名字分配 ID（从 VALID_MIN_ID 开始）
+    std::unordered_map<std::string, int> str2id;
+    int next_id = VALID_MIN_ID;
+
+    // 扫一遍 ring buffer，为每个 (func_name, line_name) 分配 ID 并聚合 CallStack
+    std::unordered_map<CallStack, int, CallStackHash, CallStackEqual> cs_agg;
+    uint64_t written = g_sample_write_idx;
+    uint64_t to_scan = written < RING_BUFFER_SIZE ? written : RING_BUFFER_SIZE;
+    char namebuf[256];
+
+    for (uint64_t i = 0; i < to_scan; i++) {
+        const Sample &s = g_samples[i];
+        if (s.source[0] == 0 && s.line <= 0) {
+            continue;
+        }
+
+        // 函数级名字：模仿 pLua 的 get_funcname 风格
+        std::string src = sanitize_source(s.source);
+        snprintf(namebuf, sizeof(namebuf), "function <%s:%d>", src.c_str(), s.linedefined);
+        std::string func_name = namebuf;
+        auto fit = str2id.find(func_name);
+        if (fit == str2id.end()) {
+            str2id[func_name] = next_id++;
+        }
+        int func_id = str2id[func_name];
+
+        // 行级名字
+        if (s.line > 0) {
+            snprintf(namebuf, sizeof(namebuf), "%s:%d", src.c_str(), s.line);
+        } else {
+            snprintf(namebuf, sizeof(namebuf), "%s:<unknown>", src.c_str());
+        }
+        std::string line_name = namebuf;
+        auto lit = str2id.find(line_name);
+        if (lit == str2id.end()) {
+            str2id[line_name] = next_id++;
+        }
+        int line_id = str2id[line_name];
+
+        // 构造 depth=2 的 CallStack
+        CallStack cs;
+        memset(&cs, 0, sizeof(cs));
+        cs.depth = 2;
+        cs.stack[0] = func_id;
+        cs.stack[1] = line_id;
+
+        cs_agg[cs]++;
+    }
+
+    // 2. 写 CallStack 条目
+    for (auto &kv : cs_agg) {
+        const CallStack &cs = kv.first;
+        int count = kv.second;
+        flush_file(fd, (const char *) &count, sizeof(count));
+        flush_file(fd, (const char *) &cs, sizeof(cs));
+    }
+
+    // 3. 写字符串表
+    int total_len = 0;
+    for (auto &kv : str2id) {
+        const std::string &str = kv.first;
+        int id = kv.second;
+
+        int len = (int) str.length();
+        if (len > PLUA_MAX_FUNC_NAME_SIZE) {
+            len = PLUA_MAX_FUNC_NAME_SIZE;
+        }
+        flush_file(fd, str.c_str(), len);
+        flush_file(fd, (const char *) &len, sizeof(len));
+        flush_file(fd, (const char *) &id, sizeof(id));
+        total_len++;
+    }
+
+    // 4. 写尾部：字符串条目总数
+    flush_file(fd, (const char *) &total_len, sizeof(total_len));
+
+    close(fd);
+}
+
+// 生成文本报告（返回 string，不写文件）
+static std::string build_text_report(
+    uint64_t total_hit, uint64_t total_tick, uint64_t written,
+    const std::unordered_map<std::string, LineAggregate> &agg,
+    const std::unordered_map<std::string, FuncAggregate> &func_agg)
+{
+    // 排序
     std::vector<LineAggregate> sorted_lines;
     sorted_lines.reserve(agg.size());
     for (auto &kv : agg) {
@@ -689,101 +848,91 @@ static void resolve_and_report() {
     std::sort(sorted_funcs.begin(), sorted_funcs.end(),
               [](const FuncAggregate &a, const FuncAggregate &b){ return a.count > b.count; });
 
-    // 把源码字符串单行化：适用于 load(str) 产生的 chunk，其 source 可能
-    // 包含多行原始代码，会破坏表格对齐。
-    auto sanitize = [](const std::string &in) -> std::string {
-        std::string s = in;
-        for (char &c : s) {
-            if (c == '\n' || c == '\r' || c == '\t') {
-                c = ' ';
-            }
-        }
-        if (s.size() > 80) {
-            s = s.substr(0, 77) + "...";
-        }
-        return s;
-    };
-
-    // 写文件
-    FILE *fp = fopen(g_filename.c_str(), "w");
-    if (!fp) {
-        VERR("open %s failed", g_filename.c_str());
-        fprintf(stderr, "vlua: open %s failed\n", g_filename.c_str());
-        return;
-    }
-
     uint64_t analysable = 0;
     for (auto &kv : agg) {
         analysable += kv.second.count;
     }
 
-    fprintf(fp, "====================  vLua sampling report  ====================\n");
-    fprintf(fp, "target function   : %s\n", g_target_name.c_str());
-    fprintf(fp, "target addr range : [%p, %p)  size=%zu\n",
+    // 用 std::string 拼接报告
+    char buf[1024];
+    std::string report;
+
+    report += "====================  vLua sampling report  ====================\n";
+    snprintf(buf, sizeof(buf), "target function   : %s\n", g_target_name.c_str());
+    report += buf;
+    snprintf(buf, sizeof(buf), "target addr range : [%p, %p)  size=%zu\n",
             (void*) g_target_addr, (void*) g_target_end,
             (size_t)(g_target_end - g_target_addr));
-    fprintf(fp, "output file       : %s\n", g_filename.c_str());
-    fprintf(fp, "sample interval   : %d us\n", SAMPLE_INTERVAL_US);
-    fprintf(fp, "ring buffer size  : %zu\n", (size_t) RING_BUFFER_SIZE);
-    fprintf(fp, "\n");
-    fprintf(fp, "total SIGPROF ticks        : %llu\n", (unsigned long long) total_tick);
-    fprintf(fp, "hits in target function    : %llu  (%.2f%% of ticks)\n",
+    report += buf;
+    snprintf(buf, sizeof(buf), "output file       : %s\n", g_filename.c_str());
+    report += buf;
+    snprintf(buf, sizeof(buf), "sample interval   : %d us\n", SAMPLE_INTERVAL_US);
+    report += buf;
+    snprintf(buf, sizeof(buf), "ring buffer size  : %zu\n", (size_t) RING_BUFFER_SIZE);
+    report += buf;
+    report += "\n";
+    snprintf(buf, sizeof(buf), "total SIGPROF ticks        : %llu\n", (unsigned long long) total_tick);
+    report += buf;
+    snprintf(buf, sizeof(buf), "hits in target function    : %llu  (%.2f%% of ticks)\n",
             (unsigned long long) total_hit,
             total_tick > 0 ? 100.0 * total_hit / total_tick : 0.0);
-    fprintf(fp, "samples written to buffer  : %llu\n",
+    report += buf;
+    snprintf(buf, sizeof(buf), "samples written to buffer  : %llu\n",
             (unsigned long long) (written < RING_BUFFER_SIZE ? written : RING_BUFFER_SIZE));
+    report += buf;
     if (written > RING_BUFFER_SIZE) {
-        fprintf(fp, "  * WARN: ring buffer overflowed, %llu samples discarded\n",
+        snprintf(buf, sizeof(buf), "  * WARN: ring buffer overflowed, %llu samples discarded\n",
                 (unsigned long long) (written - RING_BUFFER_SIZE));
+        report += buf;
     }
-    fprintf(fp, "samples analysable         : %llu\n", (unsigned long long) analysable);
-    fprintf(fp, "\n");
+    snprintf(buf, sizeof(buf), "samples analysable         : %llu\n", (unsigned long long) analysable);
+    report += buf;
+    report += "\n";
 
-    // Per-line top
-    fprintf(fp, "----------------------------------------------------------------\n");
-    fprintf(fp, "Top hotspots BY LINE (source:line -> count, pct of analysable)\n");
-    fprintf(fp, "----------------------------------------------------------------\n");
-    fprintf(fp, "%8s  %8s  %s\n", "count", "pct", "location");
+    report += "----------------------------------------------------------------\n";
+    report += "Top hotspots BY LINE (source:line -> count, pct of analysable)\n";
+    report += "----------------------------------------------------------------\n";
+    snprintf(buf, sizeof(buf), "%8s  %8s  %s\n", "count", "pct", "location");
+    report += buf;
     size_t top_n = sorted_lines.size() < 100 ? sorted_lines.size() : 100;
     for (size_t i = 0; i < top_n; i++) {
         const LineAggregate &la = sorted_lines[i];
         double pct = analysable > 0 ? 100.0 * la.count / analysable : 0.0;
-        std::string src = sanitize(la.source);
-        char loc[512];
+        std::string src = sanitize_source(la.source);
         if (la.line > 0) {
-            snprintf(loc, sizeof(loc), "%s:%d", src.c_str(), la.line);
+            snprintf(buf, sizeof(buf), "%8llu  %7.2f%%  %s:%d\n",
+                    (unsigned long long) la.count, pct, src.c_str(), la.line);
         } else {
-            snprintf(loc, sizeof(loc), "%s:<unknown>", src.c_str());
+            snprintf(buf, sizeof(buf), "%8llu  %7.2f%%  %s:<unknown>\n",
+                    (unsigned long long) la.count, pct, src.c_str());
         }
-        fprintf(fp, "%8llu  %7.2f%%  %s\n",
-                (unsigned long long) la.count, pct, loc);
+        report += buf;
     }
 
-    fprintf(fp, "\n");
-    fprintf(fp, "----------------------------------------------------------------\n");
-    fprintf(fp, "Top hotspots BY FUNCTION (source:linedefined-lastlinedefined)\n");
-    fprintf(fp, "----------------------------------------------------------------\n");
-    fprintf(fp, "%8s  %8s  %s\n", "count", "pct", "function");
+    report += "\n";
+    report += "----------------------------------------------------------------\n";
+    report += "Top hotspots BY FUNCTION (source:linedefined-lastlinedefined)\n";
+    report += "----------------------------------------------------------------\n";
+    snprintf(buf, sizeof(buf), "%8s  %8s  %s\n", "count", "pct", "function");
+    report += buf;
     size_t top_f = sorted_funcs.size() < 50 ? sorted_funcs.size() : 50;
     for (size_t i = 0; i < top_f; i++) {
         const FuncAggregate &fa = sorted_funcs[i];
         double pct = analysable > 0 ? 100.0 * fa.count / analysable : 0.0;
-        std::string src = sanitize(fa.source);
-        fprintf(fp, "%8llu  %7.2f%%  %s:%d-%d\n",
+        std::string src = sanitize_source(fa.source);
+        snprintf(buf, sizeof(buf), "%8llu  %7.2f%%  %s:%d-%d\n",
                 (unsigned long long) fa.count, pct,
                 src.c_str(), fa.linedefined, fa.lastlinedefined);
+        report += buf;
     }
-    fprintf(fp, "\n");
-    fprintf(fp, "================================================================\n");
+    report += "\n";
+    report += "================================================================\n";
 
-    fclose(fp);
-
-    printf("vlua stopped: %llu ticks, %llu hits (%.2f%%), report -> %s\n",
-           (unsigned long long) total_tick,
-           (unsigned long long) total_hit,
-           total_tick > 0 ? 100.0 * total_hit / total_tick : 0.0,
-           g_filename.c_str());
+    return report;
 }
+
+// stop 返回的文本报告
+static std::string g_text_report;
 
 static int stop_impl(lua_State *L) {
     (void) L;
@@ -811,7 +960,27 @@ static int stop_impl(lua_State *L) {
     pthread_sigmask(SIG_SETMASK, &old, NULL);
 
     // 此时可以安全读 ring buffer
-    resolve_and_report();
+    uint64_t total_hit  = g_sample_hit_count;
+    uint64_t total_tick = g_sample_total_tick;
+    uint64_t written    = g_sample_write_idx;
+    uint64_t to_scan    = written < RING_BUFFER_SIZE ? written : RING_BUFFER_SIZE;
+
+    // 聚合
+    std::unordered_map<std::string, LineAggregate> agg;
+    std::unordered_map<std::string, FuncAggregate> func_agg;
+    scan_ring_buffer(to_scan, agg, func_agg);
+
+    // 写 pLua 兼容的二进制 .pro 文件
+    flush_pro_file(agg, func_agg);
+
+    // 生成文本报告（存到全局变量，l_stop 返回给 Lua）
+    g_text_report = build_text_report(total_hit, total_tick, written, agg, func_agg);
+
+    printf("vlua stopped: %llu ticks, %llu hits (%.2f%%), report -> %s\n",
+           (unsigned long long) total_tick,
+           (unsigned long long) total_hit,
+           total_tick > 0 ? 100.0 * total_hit / total_tick : 0.0,
+           g_filename.c_str());
 
     // 恢复原 SIGSEGV/SIGBUS handler
     sigaction(SIGSEGV, &g_prev_sigsegv, NULL);
@@ -838,10 +1007,15 @@ static int l_start(lua_State *L) {
     return 1;
 }
 
-// vlua.stop()
+// vlua.stop() -> string|nil
+// 成功时返回文本报告，失败返回 nil
 static int l_stop(lua_State *L) {
     int ret = stop_impl(L);
-    lua_pushinteger(L, ret);
+    if (ret == 0) {
+        lua_pushstring(L, g_text_report.c_str());
+    } else {
+        lua_pushnil(L);
+    }
     return 1;
 }
 

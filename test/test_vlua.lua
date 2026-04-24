@@ -59,8 +59,9 @@ v.start("luaH_getshortstr", "call.pro")
 
 work()
 
-v.stop()
-print("done. see call.pro")
+local text = v.stop()
+print("--- stop() returned text report ---")
+print(text)
 
 -- luaH_newkey 函数范围较大（~1KB），在本机也容易命中，用于验证
 -- 机制正确性
@@ -74,8 +75,9 @@ for i = 1, 2000000 do
     t["k" .. i] = i
 end
 
-v.stop()
-print("done. see call_newkey.pro")
+text = v.stop()
+print("--- stop() returned text report ---")
+print(text)
 
 -- 再用 luaV_execute 验证一下机制（范围大，必然命中）
 print("")
@@ -84,5 +86,6 @@ v.start("luaV_execute", "call_vexec.pro")
 
 work()
 
-v.stop()
-print("done. see call_vexec.pro")
+text = v.stop()
+print("--- stop() returned text report ---")
+print(text)
