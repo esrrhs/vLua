@@ -39,6 +39,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <execinfo.h>
 
 extern "C" {
 #include "lua.h"
@@ -366,6 +367,28 @@ static inline uintptr_t get_pc_from_ucontext(const ucontext_t *uc) {
 #endif
 }
 
+// 检查地址是否在目标 C 函数范围内
+static inline int pc_in_target(uintptr_t addr) {
+    return addr >= g_target_addr && addr < g_target_end;
+}
+
+// 通过 backtrace() 获取被中断时的 C 调用栈，检查目标函数是否在调用链上。
+// backtrace() 使用 .eh_frame DWARF unwind info 回溯，不依赖 frame pointer，
+// 在 signal handler 中可以穿过 signal trampoline 拿到被中断代码的完整帧链。
+// 最大回溯 16 层，对 luaV_execute → 子函数的场景绰绰有余。
+static const int BACKTRACE_MAX_DEPTH = 64;
+
+static inline int check_target_in_backtrace(void) {
+    void *frames[BACKTRACE_MAX_DEPTH];
+    int n = backtrace(frames, BACKTRACE_MAX_DEPTH);
+    for (int i = 0; i < n; i++) {
+        if (pc_in_target((uintptr_t) frames[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // 判断 ci 是否是一个 Lua 函数帧（复制自 lstate.h 的 isLua 宏）
 static inline int ci_is_lua(const CallInfo *ci) {
     return ci->callstatus & CIST_LUA;
@@ -597,9 +620,15 @@ static void signal_handler(int sig, siginfo_t *si, void *ucontext) {
     ucontext_t *uc = (ucontext_t *) ucontext;
     uintptr_t pc = get_pc_from_ucontext(uc);
 
-    // 绝大多数 SIGPROF 到这里就 return，开销极低
-    if (pc < g_target_addr || pc >= g_target_end) {
-        return;
+    // 快速路径：PC 直接在目标函数内，直接命中。
+    // 绝大多数不相关的 SIGPROF 在这里就 return 了。
+    int hit = pc_in_target(pc);
+    if (!hit) {
+        // PC 不在目标函数内，可能在目标函数调用的子函数里。
+        // 通过 backtrace() 回溯 C 调用栈，检查目标函数是否在调用链上。
+        if (!check_target_in_backtrace()) {
+            return;
+        }
     }
 
     lua_State *L = g_L;
