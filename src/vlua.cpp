@@ -47,6 +47,7 @@ extern "C" {
 #include "lobject.h"
 #include "lstate.h"
 #include "lstring.h"
+#include "lopcodes.h"
 }
 
 // ----------------------------------------------------------------------------
@@ -392,13 +393,121 @@ static inline int ptr_aligned(const void *p, size_t align) {
 // luaH_getshortstr），说明当前线程正在 VM 调度中，L->ci 指向的 Lua
 // 帧对应的 closure/proto 在绝大多数情况下是 rooted 的——它就在 Lua 栈上。
 // 数据拷贝完成后就不再持有指针，后续报告阶段绝对安全。
+// 从 Proto 的 locvars 查找局部变量名（复制自 lfunc.c luaF_getlocalname 的逻辑）
+// local_number 从 1 开始（register + 1）
+static inline const char *get_localname(const Proto *p, int local_number, int pc) {
+    if (!p->locvars) {
+        return NULL;
+    }
+    for (int i = 0; i < p->sizelocvars && p->locvars[i].startpc <= pc; i++) {
+        if (pc < p->locvars[i].endpc) {
+            local_number--;
+            if (local_number == 0) {
+                TString *ts = p->locvars[i].varname;
+                if (ts && ptr_aligned(ts, 8)) {
+                    return (const char *) ts + sizeof(UTString);
+                }
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+// 尝试从 caller 的 CALL 指令推导被调用函数的名字。
+// 原理同 Lua 5.3 ldebug.c 的 funcnamefromcode + getobjname，
+// 只做常见 fast path：
+//   1. GETTABUP/GETTABLE/SELF 后跟 CALL → 从常量表拿 key 名
+//   2. GETUPVAL 后跟 CALL → 从 upvalues 描述符拿 upvalue 名
+//   3. MOVE 后跟 CALL → 从 locvars 拿局部变量名
+// 返回函数名字符串指针（指向 Proto 内部数据），失败返回 NULL。
+static inline const char *try_get_funcname_from_caller(
+    const Proto *caller_p, int caller_pc)
+{
+    if (!caller_p || !caller_p->code) {
+        return NULL;
+    }
+    if (caller_pc < 0 || caller_pc >= caller_p->sizecode) {
+        return NULL;
+    }
+
+    Instruction call_inst = caller_p->code[caller_pc];
+    OpCode call_op = GET_OPCODE(call_inst);
+    if (call_op != OP_CALL && call_op != OP_TAILCALL) {
+        return NULL;
+    }
+
+    int call_a = GETARG_A(call_inst);
+
+    // 看 CALL 前一条指令
+    if (caller_pc < 1) {
+        return NULL;
+    }
+    Instruction prev_inst = caller_p->code[caller_pc - 1];
+    OpCode prev_op = GET_OPCODE(prev_inst);
+    int prev_a = GETARG_A(prev_inst);
+
+    // 前一条指令的目标寄存器必须是 CALL 的函数寄存器
+    if (prev_a != call_a) {
+        return NULL;
+    }
+
+    switch (prev_op) {
+        case OP_GETTABUP:   // R(A) = UpValue[B][RK(C)]
+        case OP_GETTABLE:   // R(A) = R(B)[RK(C)]
+        case OP_SELF: {     // R(A+1) = R(B); R(A) = R(B)[RK(C)]
+            int key_idx = GETARG_C(prev_inst);
+            if (!ISK(key_idx)) {
+                return NULL;
+            }
+            int k_idx = INDEXK(key_idx);
+            if (k_idx < 0 || k_idx >= caller_p->sizek) {
+                return NULL;
+            }
+            const TValue *kv = &caller_p->k[k_idx];
+            if ((kv->tt_ & 0x3F) != LUA_TSHRSTR) {
+                return NULL;
+            }
+            const TString *ts = (const TString *) kv->value_.gc;
+            if (!ts || !ptr_aligned(ts, 8)) {
+                return NULL;
+            }
+            return (const char *) ts + sizeof(UTString);
+        }
+
+        case OP_GETUPVAL: {  // R(A) = UpValue[B]
+            int uv_idx = GETARG_B(prev_inst);
+            if (uv_idx < 0 || uv_idx >= caller_p->sizeupvalues) {
+                return NULL;
+            }
+            if (!caller_p->upvalues) {
+                return NULL;
+            }
+            TString *ts = caller_p->upvalues[uv_idx].name;
+            if (!ts || !ptr_aligned(ts, 8)) {
+                return NULL;
+            }
+            return (const char *) ts + sizeof(UTString);
+        }
+
+        case OP_MOVE: {  // R(A) = R(B)
+            int reg_b = GETARG_B(prev_inst);
+            return get_localname(caller_p, reg_b + 1, caller_pc - 1);
+        }
+
+        default:
+            return NULL;
+    }
+}
+
 // 从一个 CallInfo 提取帧信息到 StackFrame。
 // 返回 1 成功，0 失败（跳过该帧）。
-// 帧的 name 格式（同 pLua 的 get_funcname）：
-//   linedefined > 0  → "function <source:linedefined>"
-//   linedefined == 0 → "main chunk"
-// line 保存精确执行行号（用于文本报告的 top hotspots）。
-static inline int extract_frame(const CallInfo *ci, const lua_State *L, StackFrame *out) {
+//
+// caller_p / caller_pc 用于推导函数名（看 caller 的 CALL 指令前一条指令
+// 来找函数名常量）。如果推导失败，fallback 到 "function <source:linedefined>"。
+static inline int extract_frame(const CallInfo *ci, const lua_State *L,
+                                const Proto *caller_p, int caller_pc,
+                                StackFrame *out) {
     StkId func = ci->func;
     if (!func || !ptr_aligned(func, 8)) {
         return 0;
@@ -429,12 +538,14 @@ static inline int extract_frame(const CallInfo *ci, const lua_State *L, StackFra
     int sizecode = p->sizecode;
     int *lineinfo = p->lineinfo;
     int sizelineinfo = p->sizelineinfo;
+    int pc_offset = -1;
     if (code && sizecode > 0 && lineinfo && sizelineinfo > 0) {
         const Instruction *savedpc = ci->u.l.savedpc;
         if (savedpc) {
             ptrdiff_t d = savedpc - code - 1;
             if (d >= 0 && d < sizecode && d < sizelineinfo) {
-                line = lineinfo[(int) d];
+                pc_offset = (int) d;
+                line = lineinfo[pc_offset];
             }
         }
     }
@@ -457,12 +568,17 @@ static inline int extract_frame(const CallInfo *ci, const lua_State *L, StackFra
     }
     memcpy(out->source, src_buf, sizeof(src_buf));
 
-    // 生成函数名（同 pLua 的 get_funcname fallback 格式）
-    int linedefined = p->linedefined;
-    if (linedefined == 0) {
-        snprintf(out->name, SAMPLE_SRC_MAX, "main chunk");
+    // 生成函数名：优先从 caller 推导真实函数名
+    const char *fname = try_get_funcname_from_caller(caller_p, caller_pc);
+    if (fname) {
+        snprintf(out->name, SAMPLE_SRC_MAX, "'%s'", fname);
     } else {
-        snprintf(out->name, SAMPLE_SRC_MAX, "function <%s:%d>", src_buf, linedefined);
+        int linedefined = p->linedefined;
+        if (linedefined == 0) {
+            snprintf(out->name, SAMPLE_SRC_MAX, "main chunk");
+        } else {
+            snprintf(out->name, SAMPLE_SRC_MAX, "function <%s:%d>", src_buf, linedefined);
+        }
     }
     out->name[SAMPLE_SRC_MAX] = 0;
 
@@ -503,21 +619,60 @@ static void signal_handler(int sig, siginfo_t *si, void *ucontext) {
         return;
     }
 
-    // ---- 遍历 ci 链，收集所有 Lua 帧（从栈顶到栈底）----
-    StackFrame tmp_frames[MAX_STACK_DEPTH];
-    int tmp_depth = 0;
+    // ---- 遍历 ci 链，先收集所有 Lua 帧的 ci 指针 ----
+    const CallInfo *lua_cis[MAX_STACK_DEPTH];
+    int num_lua_cis = 0;
 
     CallInfo *ci = L->ci;
-    while (ci && tmp_depth < MAX_STACK_DEPTH) {
+    while (ci && num_lua_cis < MAX_STACK_DEPTH) {
         if (!ptr_aligned(ci, 8)) {
             break;
         }
         if (ci_is_lua(ci)) {
-            if (extract_frame(ci, L, &tmp_frames[tmp_depth])) {
-                tmp_depth++;
-            }
+            lua_cis[num_lua_cis++] = ci;
         }
         ci = ci->previous;
+    }
+    // lua_cis[0] = 栈顶，lua_cis[num-1] = 栈底
+
+    // ---- 提取每帧信息，传递 caller 的 Proto+pc 用于推导函数名 ----
+    // 对于 lua_cis[i]，它的 caller 是 lua_cis[i+1]（更深一层）
+    StackFrame tmp_frames[MAX_STACK_DEPTH];
+    int tmp_depth = 0;
+
+    for (int i = 0; i < num_lua_cis; i++) {
+        const Proto *caller_p = NULL;
+        int caller_pc = -1;
+
+        // 找 caller 帧（更深一层的 Lua 帧）
+        if (i + 1 < num_lua_cis) {
+            const CallInfo *caller_ci = lua_cis[i + 1];
+            StkId caller_func = caller_ci->func;
+            if (caller_func && ptr_aligned(caller_func, 8) &&
+                tvalue_is_lclosure(caller_func)) {
+                const GCObject *caller_gc = caller_func->value_.gc;
+                if (caller_gc && ptr_aligned(caller_gc, 8)) {
+                    const LClosure *caller_cl = (const LClosure *) caller_gc;
+                    caller_p = caller_cl->p;
+                    if (caller_p && ptr_aligned(caller_p, 8) && caller_p->code) {
+                        const Instruction *caller_savedpc = caller_ci->u.l.savedpc;
+                        if (caller_savedpc) {
+                            ptrdiff_t d = caller_savedpc - caller_p->code - 1;
+                            if (d >= 0 && d < caller_p->sizecode) {
+                                caller_pc = (int) d;
+                            }
+                        }
+                    } else {
+                        caller_p = NULL;
+                    }
+                }
+            }
+        }
+
+        if (extract_frame(lua_cis[i], L, caller_p, caller_pc,
+                          &tmp_frames[tmp_depth])) {
+            tmp_depth++;
+        }
     }
 
     tl_segv_armed = 0;
