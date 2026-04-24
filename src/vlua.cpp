@@ -92,25 +92,29 @@ static void vlog(const char *header, const char *file, const char *func, int pos
 // 100Hz 下 signal 投递本身的开销约 0.03%，可以长时间常开。
 static const int SAMPLE_INTERVAL_US = 10 * 1000;
 
-// Ring buffer 容量（条数）。每条 ~160 字节（内嵌 source 字符串），默认
-// 256K 条 ~= 40MB。100Hz 下可连续采样约 40 分钟不回绕。
+// Ring buffer 容量（条数）。100Hz 下可连续采样约 40 分钟不回绕。
 static const size_t RING_BUFFER_SIZE = 1 << 18;
 
 // Sample 内嵌的 source 字符串最大长度（截断）
 static const size_t SAMPLE_SRC_MAX = 127;
 
+// 每个采样最大栈深度（同 pLua 的 MAX_STACK_SIZE）
+static const int MAX_STACK_DEPTH = 64;
+
 // ----------------------------------------------------------------------------
 // 全局状态
 // ----------------------------------------------------------------------------
 
-// 自包含的 sample，不含任何 Lua 堆指针。这是对抗热更的关键：
-// signal handler 里就把 Proto*/TString* 解析掉，ring buffer 里只有值类型，
-// 后续 Proto 即使被 GC 回收也不影响报告。
+// 一帧栈信息：文件名 + 行号（自包含，不持有 Lua 堆指针）
+struct StackFrame {
+    char source[SAMPLE_SRC_MAX + 1];
+    int  line;
+};
+
+// 一次完整的采样：完整 Lua 调用栈（从栈底到栈顶）
 struct Sample {
-    char   source[SAMPLE_SRC_MAX + 1];  // proto->source 拷贝（截断）
-    int    line;                        // 行号，<=0 表示未知
-    int    linedefined;                 // 函数定义起始行（用于函数级聚合）
-    int    lastlinedefined;
+    int depth;                            // 有效帧数
+    StackFrame frames[MAX_STACK_DEPTH];   // frames[0] = 栈底，frames[depth-1] = 栈顶
 };
 
 // 目标 C 函数的 PC 范围
@@ -384,6 +388,68 @@ static inline int ptr_aligned(const void *p, size_t align) {
 // luaH_getshortstr），说明当前线程正在 VM 调度中，L->ci 指向的 Lua
 // 帧对应的 closure/proto 在绝大多数情况下是 rooted 的——它就在 Lua 栈上。
 // 数据拷贝完成后就不再持有指针，后续报告阶段绝对安全。
+// 从一个 CallInfo 提取 source 和 line 到 StackFrame。
+// 返回 1 成功，0 失败（跳过该帧）。
+// 调用方保证 ci 非空、已过 isLua 检查。
+static inline int extract_frame(const CallInfo *ci, const lua_State *L, StackFrame *out) {
+    StkId func = ci->func;
+    if (!func || !ptr_aligned(func, 8)) {
+        return 0;
+    }
+    if (L->stack && L->stack_last) {
+        if (func < L->stack || func > L->stack_last) {
+            return 0;
+        }
+    }
+    if (!tvalue_is_lclosure(func)) {
+        return 0;
+    }
+
+    const GCObject *gc = func->value_.gc;
+    if (!gc || !ptr_aligned(gc, 8)) {
+        return 0;
+    }
+
+    const LClosure *cl = (const LClosure *) gc;
+    const Proto *p = cl->p;
+    if (!p || !ptr_aligned(p, 8)) {
+        return 0;
+    }
+
+    // 解析行号
+    int line = -1;
+    const Instruction *code = p->code;
+    int sizecode = p->sizecode;
+    int *lineinfo = p->lineinfo;
+    int sizelineinfo = p->sizelineinfo;
+    if (code && sizecode > 0 && lineinfo && sizelineinfo > 0) {
+        const Instruction *savedpc = ci->u.l.savedpc;
+        if (savedpc) {
+            ptrdiff_t d = savedpc - code - 1;
+            if (d >= 0 && d < sizecode && d < sizelineinfo) {
+                line = lineinfo[(int) d];
+            }
+        }
+    }
+
+    // 拷贝 source 字符串
+    out->source[0] = 0;
+    out->line = line;
+    TString *src_ts = p->source;
+    if (src_ts && ptr_aligned(src_ts, 8)) {
+        const char *src = (const char *) src_ts + sizeof(UTString);
+        for (size_t i = 0; i < SAMPLE_SRC_MAX; i++) {
+            char c = src[i];
+            out->source[i] = c;
+            if (c == 0) {
+                break;
+            }
+        }
+        out->source[SAMPLE_SRC_MAX] = 0;
+    }
+    return 1;
+}
+
 static void signal_handler(int sig, siginfo_t *si, void *ucontext) {
     (void) sig; (void) si;
 
@@ -406,121 +472,48 @@ static void signal_handler(int sig, siginfo_t *si, void *ucontext) {
         return;
     }
 
-    // ---- 架起 SEGV 安全网：下面所有 deref 如果挂了会跳回这里 ----
+    // ---- 架起 SEGV 安全网 ----
     if (sigsetjmp(tl_segv_jmp, 1) != 0) {
         tl_segv_armed = 0;
-        // 访问悬空指针挂了，放弃本次采样
         return;
     }
     tl_segv_armed = 1;
 
-    // ---- 校验 L 指针大致合法 ----
     if (!ptr_aligned(L, 8)) {
         tl_segv_armed = 0;
         return;
     }
 
-    // 读 L->ci，找最近一个 Lua 帧
+    // ---- 遍历 ci 链，收集所有 Lua 帧（从栈顶到栈底）----
+    StackFrame tmp_frames[MAX_STACK_DEPTH];
+    int tmp_depth = 0;
+
     CallInfo *ci = L->ci;
-    if (!ci || !ptr_aligned(ci, 8)) {
-        tl_segv_armed = 0;
-        return;
-    }
-
-    int hops = 0;
-    while (ci && !ci_is_lua(ci) && hops < 8) {
+    while (ci && tmp_depth < MAX_STACK_DEPTH) {
+        if (!ptr_aligned(ci, 8)) {
+            break;
+        }
+        if (ci_is_lua(ci)) {
+            if (extract_frame(ci, L, &tmp_frames[tmp_depth])) {
+                tmp_depth++;
+            }
+        }
         ci = ci->previous;
-        if (ci && !ptr_aligned(ci, 8)) {
-            tl_segv_armed = 0;
-            return;
-        }
-        hops++;
-    }
-    if (!ci || !ci_is_lua(ci)) {
-        tl_segv_armed = 0;
-        return;
     }
 
-    // ---- 校验 ci->func 落在 L->stack 范围内 ----
-    StkId func = ci->func;
-    if (!func || !ptr_aligned(func, 8)) {
-        tl_segv_armed = 0;
-        return;
-    }
-    if (L->stack && L->stack_last) {
-        if (func < L->stack || func > L->stack_last) {
-            tl_segv_armed = 0;
-            return;
-        }
-    }
-
-    // ---- 校验 func 是 Lua closure ----
-    if (!tvalue_is_lclosure(func)) {
-        tl_segv_armed = 0;
-        return;
-    }
-
-    const GCObject *gc = func->value_.gc;
-    if (!gc || !ptr_aligned(gc, 8)) {
-        tl_segv_armed = 0;
-        return;
-    }
-
-    const LClosure *cl = (const LClosure *) gc;
-    const Proto *p = cl->p;
-    if (!p || !ptr_aligned(p, 8)) {
-        tl_segv_armed = 0;
-        return;
-    }
-
-    // ---- 访问 Proto 的字段 ----
-    const Instruction *code = p->code;
-    int sizecode = p->sizecode;
-    int *lineinfo = p->lineinfo;
-    int sizelineinfo = p->sizelineinfo;
-    TString *src_ts = p->source;
-    int linedefined = p->linedefined;
-    int lastlinedefined = p->lastlinedefined;
-
-    // ---- 解析 pc_offset → line ----
-    int line = -1;
-    if (code && sizecode > 0 && lineinfo && sizelineinfo > 0) {
-        const Instruction *savedpc = ci->u.l.savedpc;
-        if (savedpc) {
-            ptrdiff_t d = savedpc - code - 1;
-            if (d >= 0 && d < sizecode && d < sizelineinfo) {
-                line = lineinfo[(int) d];
-            }
-        }
-    }
-
-    // ---- 拷贝 source 字符串 ----
-    char src_buf[SAMPLE_SRC_MAX + 1];
-    src_buf[0] = 0;
-    if (src_ts && ptr_aligned(src_ts, 8)) {
-        const char *src = (const char *) src_ts + sizeof(UTString);
-        size_t n = SAMPLE_SRC_MAX;
-        for (size_t i = 0; i < n; i++) {
-            char c = src[i];
-            src_buf[i] = c;
-            if (c == 0) {
-                break;
-            }
-        }
-        src_buf[SAMPLE_SRC_MAX] = 0;
-    }
-
-    // 访问完毕，拆除安全网
     tl_segv_armed = 0;
 
-    // ---- 写入自包含的 ring buffer 槽（到这里不会再 SEGV）----
+    if (tmp_depth == 0) {
+        return;
+    }
+
+    // ---- 写入 ring buffer：翻转为栈底在前（和 pLua 一致）----
     uint64_t idx = g_sample_write_idx++;
     Sample *slot = &g_samples[idx & (RING_BUFFER_SIZE - 1)];
-
-    memcpy(slot->source, src_buf, sizeof(src_buf));
-    slot->line = line;
-    slot->linedefined = linedefined;
-    slot->lastlinedefined = lastlinedefined;
+    slot->depth = tmp_depth;
+    for (int i = 0; i < tmp_depth; i++) {
+        slot->frames[i] = tmp_frames[tmp_depth - 1 - i];
+    }
 
     g_sample_hit_count++;
 }
@@ -671,131 +664,64 @@ static std::string sanitize_source(const std::string &in) {
     return s;
 }
 
-struct LineAggregate {
-    std::string source;
-    int line;
-    uint64_t count;
-};
-
-struct FuncAggregate {
-    std::string source;
-    int linedefined;
-    int lastlinedefined;
-    uint64_t count;
-};
-
-// 扫描 ring buffer，返回聚合后的数据
-static void scan_ring_buffer(
-    uint64_t to_scan,
-    std::unordered_map<std::string, LineAggregate> &agg,
-    std::unordered_map<std::string, FuncAggregate> &func_agg)
-{
-    char keybuf[SAMPLE_SRC_MAX + 32];
-
-    for (uint64_t i = 0; i < to_scan; i++) {
-        const Sample &s = g_samples[i];
-        if (s.source[0] == 0 && s.line <= 0) {
-            continue;  // 空槽
-        }
-
-        // 行级 key
-        snprintf(keybuf, sizeof(keybuf), "%s:%d", s.source, s.line);
-        auto it = agg.find(keybuf);
-        if (it == agg.end()) {
-            LineAggregate la;
-            la.source = s.source;
-            la.line = s.line;
-            la.count = 1;
-            agg[keybuf] = la;
-        } else {
-            it->second.count++;
-        }
-
-        // 函数级 key
-        snprintf(keybuf, sizeof(keybuf), "%s:%d", s.source, s.linedefined);
-        auto fit = func_agg.find(keybuf);
-        if (fit == func_agg.end()) {
-            FuncAggregate fa;
-            fa.source = s.source;
-            fa.linedefined = s.linedefined;
-            fa.lastlinedefined = s.lastlinedefined;
-            fa.count = 1;
-            func_agg[keybuf] = fa;
-        } else {
-            fit->second.count++;
-        }
+// 为 StackFrame 生成显示名字：source:line
+static std::string frame_name(const StackFrame &f) {
+    char buf[256];
+    std::string src = sanitize_source(f.source);
+    if (f.line > 0) {
+        snprintf(buf, sizeof(buf), "%s:%d", src.c_str(), f.line);
+    } else {
+        snprintf(buf, sizeof(buf), "%s:<unknown>", src.c_str());
     }
+    return buf;
 }
 
 // 写 pLua 兼容的 .pro 二进制文件。
-// 格式（与 plua.cpp flush() 完全一致，plua.go 可直接解析）：
+// 格式与 plua.cpp flush() 完全一致：
 //   [N 个 CallStack 条目]: count(int32) + CallStack{depth(int32) + stack[64](int32×64)}
 //   [M 个字符串条目]:      name(变长bytes) + name_len(int32) + id(int32)
 //   [尾部 4 字节]:          M(int32) = 字符串条目总数
 //
-// 每个采样点对应一个 depth=2 的 CallStack：
-//   stack[0] = 函数级 ID（"function <@file.lua:24>"）
-//   stack[1] = 行级 ID（"@file.lua:27"）
-static void flush_pro_file(
-    const std::unordered_map<std::string, LineAggregate> &agg,
-    const std::unordered_map<std::string, FuncAggregate> &func_agg)
-{
+// 每帧对应一个 string ID（"@file.lua:27"），完整栈直接映射为 CallStack。
+static void flush_pro_file(uint64_t to_scan) {
     int fd = open(g_filename.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (fd < 0) {
         VERR("open %s failed", g_filename.c_str());
         return;
     }
 
-    // 1. 为所有唯一名字分配 ID（从 VALID_MIN_ID 开始）
     std::unordered_map<std::string, int> str2id;
     int next_id = VALID_MIN_ID;
 
-    // 扫一遍 ring buffer，为每个 (func_name, line_name) 分配 ID 并聚合 CallStack
+    // 为每个 Sample 构造 CallStack（用 string ID），聚合相同 CallStack 的计数
     std::unordered_map<CallStack, int, CallStackHash, CallStackEqual> cs_agg;
-    uint64_t written = g_sample_write_idx;
-    uint64_t to_scan = written < RING_BUFFER_SIZE ? written : RING_BUFFER_SIZE;
-    char namebuf[256];
 
     for (uint64_t i = 0; i < to_scan; i++) {
         const Sample &s = g_samples[i];
-        if (s.source[0] == 0 && s.line <= 0) {
+        if (s.depth <= 0) {
             continue;
         }
 
-        // 函数级名字：模仿 pLua 的 get_funcname 风格
-        std::string src = sanitize_source(s.source);
-        snprintf(namebuf, sizeof(namebuf), "function <%s:%d>", src.c_str(), s.linedefined);
-        std::string func_name = namebuf;
-        auto fit = str2id.find(func_name);
-        if (fit == str2id.end()) {
-            str2id[func_name] = next_id++;
-        }
-        int func_id = str2id[func_name];
-
-        // 行级名字
-        if (s.line > 0) {
-            snprintf(namebuf, sizeof(namebuf), "%s:%d", src.c_str(), s.line);
-        } else {
-            snprintf(namebuf, sizeof(namebuf), "%s:<unknown>", src.c_str());
-        }
-        std::string line_name = namebuf;
-        auto lit = str2id.find(line_name);
-        if (lit == str2id.end()) {
-            str2id[line_name] = next_id++;
-        }
-        int line_id = str2id[line_name];
-
-        // 构造 depth=2 的 CallStack
         CallStack cs;
         memset(&cs, 0, sizeof(cs));
-        cs.depth = 2;
-        cs.stack[0] = func_id;
-        cs.stack[1] = line_id;
+        cs.depth = s.depth;
+
+        for (int j = 0; j < s.depth; j++) {
+            std::string name = frame_name(s.frames[j]);
+            auto it = str2id.find(name);
+            if (it == str2id.end()) {
+                str2id[name] = next_id;
+                cs.stack[j] = next_id;
+                next_id++;
+            } else {
+                cs.stack[j] = it->second;
+            }
+        }
 
         cs_agg[cs]++;
     }
 
-    // 2. 写 CallStack 条目
+    // 写 CallStack 条目
     for (auto &kv : cs_agg) {
         const CallStack &cs = kv.first;
         int count = kv.second;
@@ -803,7 +729,7 @@ static void flush_pro_file(
         flush_file(fd, (const char *) &cs, sizeof(cs));
     }
 
-    // 3. 写字符串表
+    // 写字符串表
     int total_len = 0;
     for (auto &kv : str2id) {
         const std::string &str = kv.first;
@@ -819,41 +745,43 @@ static void flush_pro_file(
         total_len++;
     }
 
-    // 4. 写尾部：字符串条目总数
+    // 写尾部：字符串条目总数
     flush_file(fd, (const char *) &total_len, sizeof(total_len));
-
     close(fd);
 }
 
 // 生成文本报告（返回 string，不写文件）
+// 统计维度：栈顶帧的 source:line（即直接触发目标 C 函数的 Lua 行）
 static std::string build_text_report(
-    uint64_t total_hit, uint64_t total_tick, uint64_t written,
-    const std::unordered_map<std::string, LineAggregate> &agg,
-    const std::unordered_map<std::string, FuncAggregate> &func_agg)
+    uint64_t total_hit, uint64_t total_tick, uint64_t written, uint64_t to_scan)
 {
-    // 排序
-    std::vector<LineAggregate> sorted_lines;
-    sorted_lines.reserve(agg.size());
-    for (auto &kv : agg) {
-        sorted_lines.push_back(kv.second);
-    }
-    std::sort(sorted_lines.begin(), sorted_lines.end(),
-              [](const LineAggregate &a, const LineAggregate &b){ return a.count > b.count; });
+    // 按栈顶帧聚合
+    struct LineCount { std::string name; uint64_t count; };
+    std::unordered_map<std::string, uint64_t> top_agg;
 
-    std::vector<FuncAggregate> sorted_funcs;
-    sorted_funcs.reserve(func_agg.size());
-    for (auto &kv : func_agg) {
-        sorted_funcs.push_back(kv.second);
+    for (uint64_t i = 0; i < to_scan; i++) {
+        const Sample &s = g_samples[i];
+        if (s.depth <= 0) {
+            continue;
+        }
+        // 栈顶 = frames[depth-1]
+        std::string name = frame_name(s.frames[s.depth - 1]);
+        top_agg[name]++;
     }
-    std::sort(sorted_funcs.begin(), sorted_funcs.end(),
-              [](const FuncAggregate &a, const FuncAggregate &b){ return a.count > b.count; });
+
+    std::vector<LineCount> sorted;
+    sorted.reserve(top_agg.size());
+    for (auto &kv : top_agg) {
+        sorted.push_back({kv.first, kv.second});
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const LineCount &a, const LineCount &b){ return a.count > b.count; });
 
     uint64_t analysable = 0;
-    for (auto &kv : agg) {
-        analysable += kv.second.count;
+    for (auto &kv : top_agg) {
+        analysable += kv.second;
     }
 
-    // 用 std::string 拼接报告
     char buf[1024];
     std::string report;
 
@@ -890,43 +818,20 @@ static std::string build_text_report(
     report += "\n";
 
     report += "----------------------------------------------------------------\n";
-    report += "Top hotspots BY LINE (source:line -> count, pct of analysable)\n";
+    report += "Top hotspots (source:line -> count, pct of analysable)\n";
     report += "----------------------------------------------------------------\n";
     snprintf(buf, sizeof(buf), "%8s  %8s  %s\n", "count", "pct", "location");
     report += buf;
-    size_t top_n = sorted_lines.size() < 100 ? sorted_lines.size() : 100;
+    size_t top_n = sorted.size() < 100 ? sorted.size() : 100;
     for (size_t i = 0; i < top_n; i++) {
-        const LineAggregate &la = sorted_lines[i];
-        double pct = analysable > 0 ? 100.0 * la.count / analysable : 0.0;
-        std::string src = sanitize_source(la.source);
-        if (la.line > 0) {
-            snprintf(buf, sizeof(buf), "%8llu  %7.2f%%  %s:%d\n",
-                    (unsigned long long) la.count, pct, src.c_str(), la.line);
-        } else {
-            snprintf(buf, sizeof(buf), "%8llu  %7.2f%%  %s:<unknown>\n",
-                    (unsigned long long) la.count, pct, src.c_str());
-        }
-        report += buf;
-    }
-
-    report += "\n";
-    report += "----------------------------------------------------------------\n";
-    report += "Top hotspots BY FUNCTION (source:linedefined-lastlinedefined)\n";
-    report += "----------------------------------------------------------------\n";
-    snprintf(buf, sizeof(buf), "%8s  %8s  %s\n", "count", "pct", "function");
-    report += buf;
-    size_t top_f = sorted_funcs.size() < 50 ? sorted_funcs.size() : 50;
-    for (size_t i = 0; i < top_f; i++) {
-        const FuncAggregate &fa = sorted_funcs[i];
-        double pct = analysable > 0 ? 100.0 * fa.count / analysable : 0.0;
-        std::string src = sanitize_source(fa.source);
-        snprintf(buf, sizeof(buf), "%8llu  %7.2f%%  %s:%d-%d\n",
-                (unsigned long long) fa.count, pct,
-                src.c_str(), fa.linedefined, fa.lastlinedefined);
+        double pct = analysable > 0 ? 100.0 * sorted[i].count / analysable : 0.0;
+        snprintf(buf, sizeof(buf), "%8llu  %7.2f%%  %s\n",
+                (unsigned long long) sorted[i].count, pct, sorted[i].name.c_str());
         report += buf;
     }
     report += "\n";
     report += "================================================================\n";
+    report += "(use plua.go + pprof on the .pro file for full callstack / flamegraph)\n";
 
     return report;
 }
@@ -965,16 +870,11 @@ static int stop_impl(lua_State *L) {
     uint64_t written    = g_sample_write_idx;
     uint64_t to_scan    = written < RING_BUFFER_SIZE ? written : RING_BUFFER_SIZE;
 
-    // 聚合
-    std::unordered_map<std::string, LineAggregate> agg;
-    std::unordered_map<std::string, FuncAggregate> func_agg;
-    scan_ring_buffer(to_scan, agg, func_agg);
+    // 写 pLua 兼容的二进制 .pro 文件（完整栈）
+    flush_pro_file(to_scan);
 
-    // 写 pLua 兼容的二进制 .pro 文件
-    flush_pro_file(agg, func_agg);
-
-    // 生成文本报告（存到全局变量，l_stop 返回给 Lua）
-    g_text_report = build_text_report(total_hit, total_tick, written, agg, func_agg);
+    // 生成文本报告（栈顶帧聚合）
+    g_text_report = build_text_report(total_hit, total_tick, written, to_scan);
 
     printf("vlua stopped: %llu ticks, %llu hits (%.2f%%), report -> %s\n",
            (unsigned long long) total_tick,
