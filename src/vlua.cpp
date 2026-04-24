@@ -1116,10 +1116,11 @@ extern "C" int lrealstart(lua_State *L, const char *func_name, const char *file)
 }
 
 // hookso 注入入口：停止采样
-// 只设 g_running = 0，通过 lua_sethook 延迟到 Lua VM 安全上下文执行 stop_impl。
+// 通过 lua_sethook 延迟到 Lua VM 安全上下文执行 stop_impl。
+// 注意：不能在这里设 g_running = 0，否则 stop_impl 会因为 g_running==0 而提前返回，
+// 导致 .pro 文件不会被写入。g_running 的置零由 stop_impl 内部处理。
 // 用法：hookso call $PID libvlua.so lrealstop i=$L
 extern "C" int lrealstop(lua_State *L) {
-    g_running = 0;
     lua_sethook(L, StopHandlerHook, LUA_MASKCOUNT, 1);
     VLOG("lrealstop");
     return 0;
