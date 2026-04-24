@@ -24,6 +24,7 @@ perf 能看到 `luaH_getshortstr` 占 13% CPU，但看不到是哪些 Lua 代码
 输出 `bin/libvlua.so` 及 `tools/vlua`、`tools/png`。
 
 ## 使用
+#### 修改 Lua 代码
 ```lua
 local v = require "libvlua"
 
@@ -36,6 +37,21 @@ do_some_thing()
 -- 结束采样，返回文本摘要报告
 local text = v.stop()
 print(text)
+```
+#### 或者用 [hookso](https://github.com/esrrhs/hookso) 注入
+```shell
+# a) 获取进程中的 lua_State 指针，比如进程的 xxx.so 调用了 lua_settop(L)，取第一个参数
+./hookso arg $PID xxx.so lua_settop 1
+# 输出: 123456
+
+# b) 加载 libvlua.so
+./hookso dlopen $PID ./libvlua.so
+
+# c) 开启采样，等价于 lrealstart(L, "luaH_getshortstr", "./call.pro")
+./hookso call $PID libvlua.so lrealstart i=123456 s="luaH_getshortstr" s="./call.pro"
+
+# d) 关闭采样，等价于 lrealstop(L)
+./hookso call $PID libvlua.so lrealstop i=123456
 ```
 
 ## 生成可视化结果

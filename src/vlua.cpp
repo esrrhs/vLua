@@ -1074,8 +1074,56 @@ static int stop_impl(lua_State *L) {
 }
 
 // ----------------------------------------------------------------------------
-// Lua binding
+// Lua binding + hookso 注入接口
 // ----------------------------------------------------------------------------
+
+// hookso 注入时的参数暂存
+static std::string g_pending_func_name;
+static std::string g_pending_filename;
+
+// lua_sethook 回调：在 Lua VM 安全上下文中执行真正的 start
+static void StartHandlerHook(lua_State *L, lua_Debug *par) {
+    (void) par;
+    start_impl(L, g_pending_func_name.c_str(), g_pending_filename.c_str());
+    lua_sethook(L, 0, 0, 0);
+}
+
+// lua_sethook 回调：在 Lua VM 安全上下文中执行真正的 stop
+static void StopHandlerHook(lua_State *L, lua_Debug *par) {
+    (void) par;
+    stop_impl(L);
+    lua_sethook(L, 0, 0, 0);
+}
+
+// hookso 注入入口：开始采样
+// hookso 可能在任意时刻注入调用此函数，不能直接操作 Lua 栈，
+// 因此只保存参数并通过 lua_sethook 延迟到 Lua VM 安全上下文执行。
+// 用法：hookso call $PID libvlua.so lrealstart i=$L s="luaH_getshortstr" s="./call.pro"
+extern "C" int lrealstart(lua_State *L, const char *func_name, const char *file) {
+    if (g_running) {
+        VERR("start again, failed");
+        return -1;
+    }
+
+    g_L = L;
+    g_pending_func_name = func_name;
+    g_pending_filename = file;
+
+    lua_sethook(g_L, StartHandlerHook, LUA_MASKCOUNT, 1);
+
+    VLOG("lrealstart %s %s", func_name, file);
+    return 0;
+}
+
+// hookso 注入入口：停止采样
+// 只设 g_running = 0，通过 lua_sethook 延迟到 Lua VM 安全上下文执行 stop_impl。
+// 用法：hookso call $PID libvlua.so lrealstop i=$L
+extern "C" int lrealstop(lua_State *L) {
+    g_running = 0;
+    lua_sethook(L, StopHandlerHook, LUA_MASKCOUNT, 1);
+    VLOG("lrealstop");
+    return 0;
+}
 
 // vlua.start(func_name, output_file)
 static int l_start(lua_State *L) {
