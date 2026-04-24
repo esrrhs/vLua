@@ -52,18 +52,21 @@ cd tools
 
 ## 示例
 
-采样 `luaV_execute` 的调用图：
+模拟 table get-by-string 热点场景（深嵌套 `player.role.battle.stat.kill` 等链式访问），采样 `luaV_execute`：
 
-![image](test/call_vexec.png)
+#### 调用图
+![image](test/getstr.png)
 
-`v.stop()` 返回的文本摘要：
+#### `v.stop()` 返回的文本摘要
 ```
 Top hotspots (source:line -> count, pct of analysable)
    count       pct  location
-      75    23.10%  @test_vlua.lua:35
-      58    17.90%  @test_vlua.lua:26
-      50    16.40%  @test_vlua.lua:28
-      46    15.10%  @test_vlua.lua:27
+      80    21.16%  @test_getstr.lua:18     -- player.role.battle.stat.kill = ...
+      71    18.78%  @test_getstr.lua:19     -- player.role.battle.stat.death = ...
+      67    17.72%  @test_getstr.lua:28     -- player.role.pos.x = ...
+      51    13.49%  @test_getstr.lua:29     -- player.role.pos.y = ...
+      47    12.43%  @test_getstr.lua:20     -- player.role.battle.stat.assist = ...
+      42    11.11%  @test_getstr.lua:27     -- 循环入口
       ...
 ```
 
