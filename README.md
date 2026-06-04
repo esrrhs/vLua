@@ -2,6 +2,7 @@
 
 [<img src="https://img.shields.io/github/license/esrrhs/vLua">](https://github.com/esrrhs/vLua)
 [<img src="https://img.shields.io/github/languages/top/esrrhs/vLua">](https://github.com/esrrhs/vLua)
+[<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/vLua/cmake-multi-platform.yml?branch=master">](https://github.com/esrrhs/vLua/actions)
 
 Lua 虚拟机 C 函数级采样分析工具
 
