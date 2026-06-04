@@ -87,7 +87,7 @@ local function main()
     end
 end
 
-v.start("luaV_execute", "getstr.pro")
+v.start("luaH_getshortstr", "getstr.pro")
 main()
 local text = v.stop()
 print(text)
