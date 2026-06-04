@@ -32,8 +32,16 @@ src/lundump.h
 src/lvm.h
 src/lzio.h
 
-# sampling reports produced by tests
+# sampling reports / visualization artifacts produced by tests
 test/*.pro
+test/*.prof
+test/*.dot
+test/*.fl
+test/*.svg
+test/*.png
+!test/getstr.png   # README 引用，必须保留
+test/luac.out      # luac -l -l 副产物
+test/luac.out      # luac -l -l 副产物
 
 # go build output in tools/
 tools/vlua

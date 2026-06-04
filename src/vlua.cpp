@@ -94,8 +94,11 @@ static void vlog(const char *header, const char *file, const char *func, int pos
 // 100Hz 下 signal 投递本身的开销约 0.03%，可以长时间常开。
 static const int SAMPLE_INTERVAL_US = 10 * 1000;
 
-// Ring buffer 容量（条数）。100Hz 下可连续采样约 40 分钟不回绕。
-static const size_t RING_BUFFER_SIZE = 1 << 18;
+// Ring buffer 容量（条数）。100Hz 下可连续采样约 2.7 分钟不回绕。
+// 单条 Sample 约 16 KB（depth + 64 frames × 260 字节），1<<14 ≈ 256 MB
+// 虚拟内存预留；命中率较低时可采更长时间，回绕后老样本被覆盖、报告会
+// 给出 WARN: ring buffer overflowed 提示。
+static const size_t RING_BUFFER_SIZE = 1 << 14;
 
 // Sample 内嵌的 source 字符串最大长度（截断）
 static const size_t SAMPLE_SRC_MAX = 127;
@@ -328,6 +331,9 @@ static __thread volatile int tl_segv_hit   = 0;
 // 其他时候保持原语义（chain 到应用自己的 handler 或内核默认行为）
 static struct sigaction g_prev_sigsegv;
 static struct sigaction g_prev_sigbus;
+// SIGPROF 原 handler：start 时保存，stop 时恢复，避免污染宿主进程的
+// SIGPROF 处理（比如宿主自己也用 ITIMER_PROF 做 profiling）
+static struct sigaction g_prev_sigprof;
 
 static void segv_handler(int sig, siginfo_t *si, void *ucontext) {
     if (tl_segv_armed) {
@@ -731,6 +737,16 @@ static int start_impl(lua_State *L, const char *func_name, const char *file) {
         return -1;
     }
 
+    // 预热 backtrace()：glibc 的 backtrace() 首次调用可能 dlopen
+    // libgcc_s.so 加载 unwind 支持，dlopen 不是 async-signal-safe，
+    // 如果第一次调用发生在 SIGPROF handler 里、且被打断的代码刚好
+    // 持有 dynamic loader 锁，会死锁。这里在主线程提前触发一次，
+    // 保证后续 signal handler 里 backtrace() 不会再走 dlopen 路径。
+    {
+        void *warmup_frames[1];
+        (void) backtrace(warmup_frames, 1);
+    }
+
     uintptr_t addr = 0;
     size_t size = 0;
     if (resolve_symbol(func_name, &addr, &size) != 0) {
@@ -758,13 +774,13 @@ static int start_impl(lua_State *L, const char *func_name, const char *file) {
     g_sample_hit_count = 0;
     g_sample_total_tick = 0;
 
-    // 安装 SIGPROF handler
+    // 安装 SIGPROF handler，保存原 handler 用于 stop 时恢复
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = signal_handler;
     sa.sa_flags = SA_RESTART | SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGPROF, &sa, NULL) != 0) {
+    if (sigaction(SIGPROF, &sa, &g_prev_sigprof) != 0) {
         VERR("sigaction(SIGPROF) failed: %s", strerror(errno));
         return -1;
     }
@@ -778,11 +794,13 @@ static int start_impl(lua_State *L, const char *func_name, const char *file) {
     sigemptyset(&sa_segv.sa_mask);
     if (sigaction(SIGSEGV, &sa_segv, &g_prev_sigsegv) != 0) {
         VERR("sigaction(SIGSEGV) failed: %s", strerror(errno));
+        sigaction(SIGPROF, &g_prev_sigprof, NULL);
         return -1;
     }
     if (sigaction(SIGBUS, &sa_segv, &g_prev_sigbus) != 0) {
         VERR("sigaction(SIGBUS) failed: %s", strerror(errno));
         sigaction(SIGSEGV, &g_prev_sigsegv, NULL);
+        sigaction(SIGPROF, &g_prev_sigprof, NULL);
         return -1;
     }
 
@@ -1090,9 +1108,10 @@ static int stop_impl(lua_State *L) {
            total_tick > 0 ? 100.0 * total_hit / total_tick : 0.0,
            g_filename.c_str());
 
-    // 恢复原 SIGSEGV/SIGBUS handler
+    // 恢复原 SIGSEGV/SIGBUS/SIGPROF handler
     sigaction(SIGSEGV, &g_prev_sigsegv, NULL);
     sigaction(SIGBUS,  &g_prev_sigbus,  NULL);
+    sigaction(SIGPROF, &g_prev_sigprof, NULL);
 
     // 清理
     g_L = NULL;
