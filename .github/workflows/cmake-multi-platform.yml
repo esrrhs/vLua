@@ -9,16 +9,7 @@ jobs:
     
     steps:
     - uses: actions/checkout@v1
-        
-    - name: prepare-lua
-      run: |
-        sudo apt-get install libreadline-dev -y
-        sudo wget https://www.lua.org/ftp/lua-5.3.6.tar.gz
-        sudo tar -xf lua-5.3.6.tar.gz
-        cd lua-5.3.6
-        sudo make linux
-        sudo make install
-        
+
     - name: make
       run: |
         sudo ./build.sh
