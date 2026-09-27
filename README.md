@@ -1,80 +1,127 @@
 # vLua
 
+[English](README.md) | [中文说明](README_CN.md)
+
 [<img src="https://img.shields.io/github/license/esrrhs/vLua">](https://github.com/esrrhs/vLua)
 [<img src="https://img.shields.io/github/languages/top/esrrhs/vLua">](https://github.com/esrrhs/vLua)
-[<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/vLua/cmake-multi-platform.yml?branch=master">](https://github.com/esrrhs/vLua/actions)
+[<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/vLua/ccpp.yml?branch=master">](https://github.com/esrrhs/vLua/actions)
 
-Lua 虚拟机 C 函数级采样分析工具
+Attribute Lua VM C-function CPU time back to Lua source lines.
 
-## 简介
-把 Lua VM 内部 C 函数（如 `luaH_getshortstr`、`luaH_newkey`、`internshrstr` 等）的 CPU 消耗**精确归因到 Lua 源码行**，并输出完整调用栈。
+## Overview
 
-perf 能看到 `luaH_getshortstr` 占 13% CPU，但看不到是哪些 Lua 代码在贡献这 13%。vLua 解决的就是这个问题。
+`perf` can show that `luaH_getshortstr` costs 13% CPU, but not **which Lua lines** contribute that 13%. **vLua** samples only while a chosen Lua VM C function is on CPU, then attributes those samples to Lua source locations with full call stacks.
 
-## 特性
-- **精准**，SIGPROF 定时采样 + PC 范围判断，只在目标 C 函数执行时捕获 Lua 调用栈
-- **轻量**，100Hz 采样下 overhead ≈ 0.03%，可长期常开
-- **安全**，signal handler 内就地解析，ring buffer 只存值类型不存指针；SIGSEGV trampoline 兜底，热更期间不会崩
-- **兼容**，输出 [pLua](https://github.com/esrrhs/pLua) 格式的 .pro 文件，可直接用 pprof、[火焰图](https://github.com/brendangregg/FlameGraph) 工具链分析
-- **灵活**，目标函数名作为参数传入，可以分析任意 Lua VM 内部 C 函数
+## Features
 
-## 编译
+- **Precise**: SIGPROF sampling + PC-range filter — capture Lua stacks only when the target C function is executing
+- **Lightweight**: ~0.03% overhead at 100Hz — safe to leave on in production
+- **Safe**: signal-handler parses stacks in place; ring buffer stores value types only; SIGSEGV trampoline covers hot-reload races
+- **Compatible**: writes [pLua](https://github.com/esrrhs/pLua)-format `.pro` files for pprof / [FlameGraph](https://github.com/brendangregg/FlameGraph)
+- **Flexible**: target C function name is a parameter — profile any Lua VM internal
+
+## Build
+
+vLua vendors **Lua 5.3.6** headers (private VM structs). CMake extracts `dep/lua-5.3.6.tar.gz` automatically.
+
 ```shell
 ./build.sh
+# or:
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
-输出 `bin/libvlua.so` 及 `tools/vlua`、`tools/png`。
 
-## 使用
-#### 修改 Lua 代码
+Outputs:
+
+- `bin/libvlua.so` — sampler shared library
+- `bin/vlua` — profile converter (if Go is available)
+- `build/lua/lua53` — matching Lua 5.3.6 interpreter for tests
+
+## Test
+
+```shell
+ctest --test-dir build --output-on-failure
+```
+
+Or run a script directly with the vendored interpreter:
+
+```shell
+cd test
+../build/lua/lua53 test_getstr.lua
+```
+
+## Usage
+
+### Embed in Lua
+
 ```lua
 local v = require "libvlua"
 
--- 参数1：要采样的 C 函数名
--- 参数2：采样结果文件（pLua 兼容的二进制格式）
+-- Arg 1: Lua VM C function to sample
+-- Arg 2: output .pro file (pLua-compatible)
 v.start("luaH_getshortstr", "call.pro")
 
 do_some_thing()
 
--- 结束采样，返回文本摘要报告
+-- Stop sampling; returns a text hotspot summary
 local text = v.stop()
 print(text)
 ```
-#### 或者用 [hookso](https://github.com/esrrhs/hookso) 注入
-```shell
-# a) 获取进程中的 lua_State 指针，比如进程的 xxx.so 调用了 lua_settop(L)，取第一个参数
-./hookso arg $PID xxx.so lua_settop 1
-# 输出: 123456
 
-# b) 加载 libvlua.so
+### Inject with [hookso](https://github.com/esrrhs/hookso)
+
+```shell
+# a) Get lua_State* (e.g. first arg of lua_settop in xxx.so)
+./hookso arg $PID xxx.so lua_settop 1
+# => 123456
+
+# b) Load libvlua.so
 ./hookso dlopen $PID ./libvlua.so
 
-# c) 开启采样，等价于 lrealstart(L, "luaH_getshortstr", "./call.pro")
+# c) Start: lrealstart(L, "luaH_getshortstr", "./call.pro")
 ./hookso call $PID libvlua.so lrealstart i=123456 s="luaH_getshortstr" s="./call.pro"
 
-# d) 关闭采样，等价于 lrealstop(L)
+# d) Stop: lrealstop(L)
 ./hookso call $PID libvlua.so lrealstop i=123456
 ```
 
-## 生成可视化结果
+## Visualization & Tools
+
+The `tools/` directory converts `.pro` profile data into FlameGraph SVGs and call graph images.
+
+### Prerequisites (Optional)
+
+- **FlameGraph**: `show.sh` fetches `flamegraph.pl` from GitHub if not found locally or in `PATH`. On CentOS/RHEL you may need `yum install perl-open`.
+- **Graphviz** (call graph PNG): `sudo apt install graphviz` / `sudo yum install graphviz`
+- **pprof** (call graph DOT/PNG): `sudo apt install google-perftools` / `sudo yum install gperftools`
+
+### Generate Visualizations
+
 ```shell
 cd tools
 ./show.sh ../test
 ```
-或手动：
-```shell
-./vlua -i call.pro -pprof call.prof
-./pprof --collapsed call.prof 2>/dev/null > call.fl
-./flamegraph.pl call.fl > call.svg
-```
 
-## 示例
+This generates:
 
-模拟 table get-by-string 热点场景（深嵌套 `player.role.battle.stat.kill` 等链式访问），采样 `luaH_getshortstr`：
+- `<name>.fl`: Folded stack traces
+- `<name>.svg`: Interactive SVG flame graph
+- `<name>.prof`: Symbolized pprof profile
+- `<name>.dot`: Graphviz call graph
+- `<name>.png`: Rendered PNG call graph (if graphviz and pprof are installed)
 
-#### 调用图
+`show.sh` looks for `bin/vlua` (built by CMake) or builds `tools/vlua` via Go on demand.
+
+## Example
+
+Simulated table get-by-string hotspots (nested `player.role.battle.stat.kill` chains), sampling `luaH_getshortstr`:
+
+#### Call graph
+
 ![image](test/getstr.png)
 
-#### `v.stop()` 返回的文本摘要
+#### Text summary from `v.stop()`
+
 ```
 Top hotspots (source:line -> count, pct of analysable)
    count       pct  location
@@ -82,18 +129,21 @@ Top hotspots (source:line -> count, pct of analysable)
      131    27.29%  @test_getstr.lua:36     -- update_kill: player.role.battle.stat.kill = ...
       63    13.12%  @test_getstr.lua:49     -- update_pos: player.role.pos.y = ...
       57    11.88%  @test_getstr.lua:48     -- update_pos: player.role.pos.x = ...
-      42     8.75%  @test_getstr.lua:30     -- calc_ammo: player.role.battle.weapon.ammo = ...
-      18     3.75%  @test_getstr.lua:42     -- update_death: player.role.battle.stat.death = ...
-      17     3.54%  @test_getstr.lua:55     -- check_bag: player.role.bag.capacity
       ...
 ```
 
-## 注意事项
-- 二进制不要 `strip`，`luaH_getshortstr` 等 static 符号只在 `.symtab` 中
-  - 验证：`nm <binary> | grep luaH_getshortstr`
-- 热更期间可以常开，不会崩（三层防护：值类型 Sample + 指针校验 + SIGSEGV trampoline）
-- 当前假设单 Lua VM（`g_L`），多 lua_State 场景需要扩展
+## Notes
 
-## 其他
-[lua全家桶](https://github.com/esrrhs/lua-family-bucket)
+- Do **not** strip the host binary — static symbols like `luaH_getshortstr` live in `.symtab`  
+  Verify: `nm <binary> | grep luaH_getshortstr`
+- Safe during hot-reload (value-type samples + pointer checks + SIGSEGV trampoline)
+- Currently assumes a single Lua VM (`g_L`); multi-`lua_State` needs extension
+- Headers / test interpreter are Lua **5.3.6**; host process must use a matching 5.3.x VM layout
 
+## Related
+
+[lua-family-bucket](https://github.com/esrrhs/lua-family-bucket) · [pLua](https://github.com/esrrhs/pLua) · [hookso](https://github.com/esrrhs/hookso)
+
+## License
+
+MIT

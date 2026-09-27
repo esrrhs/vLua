@@ -1,35 +1,18 @@
-#! /bin/sh
-dir=$(cd `dirname $0`;pwd)
-projectdir=$dir
-builddir="$projectdir/build"
-rundir="$projectdir/bin"
-luadir="$projectdir/dep/lua-5.3.6"
-lua="$projectdir/dep/lua-5.3.6.tar.gz"
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 解压 lua 源码，拷贝头文件到 src（同 pLua 做法）
-if [ -f "$lua" ] && [ ! -d "$luadir" ]; then
-  cd $projectdir/dep && tar zxvf $lua
-  cd $projectdir && cp $projectdir/dep/lua-5.3.6/src/*.h $projectdir/src
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="${ROOT}/build"
+
+mkdir -p "${ROOT}/bin"
+rm -rf "${BUILD_DIR}"
+mkdir -p "${BUILD_DIR}"
+
+cmake -S "${ROOT}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build "${BUILD_DIR}" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
+
+echo "Build complete: ${ROOT}/bin/libvlua.so"
+if [ -x "${ROOT}/bin/vlua" ]; then
+  echo "Tool built:    ${ROOT}/bin/vlua"
 fi
-
-if [ ! -d "$rundir" ]; then
-  mkdir -p $rundir && cd $rundir
-fi
-
-if [ -d "$builddir" ]; then
-  rm $builddir -rf
-  mkdir -p $builddir && cd $builddir
-else
-  mkdir -p $builddir && cd $builddir
-fi
-
-cmake ../
-make
-
-cd $projectdir/tools
-GO111MODULE=off go build vlua.go
-GO111MODULE=off go build png.go
-
-chmod a+x pprof
-chmod a+x *.pl
-chmod a+x *.sh
+echo "Lua 5.3.6:     ${BUILD_DIR}/lua/lua53"

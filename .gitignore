@@ -1,11 +1,28 @@
-# build output
+# IDE / OS
+.idea/
+.vscode/
+.vs/
+.DS_Store
+*~
+.*.swp
+CMakeSettings.txt
+CMakeSettings.json
+
+# Build output
 build/
 bin/
+cmake-build-*/
+debug/
+obj/
+tags
+GPATH
+GRTAGS
+GTAGS
 
-# extracted lua source (kept as tarball in dep/)
+# Extracted vendored Lua (kept as tarball in dep/)
 dep/lua-5.3.6/
 
-# lua headers copied into src/ by build.sh
+# Legacy copied headers (no longer used; include from dep/ instead)
 src/lapi.h
 src/lauxlib.h
 src/lcode.h
@@ -32,22 +49,23 @@ src/lundump.h
 src/lvm.h
 src/lzio.h
 
-# sampling reports / visualization artifacts produced by tests
-test/*.pro
-test/*.prof
-test/*.dot
-test/*.fl
-test/*.svg
+# Sampling reports / visualization artifacts
+*.pro
+*.prof
+*.dot
+*.fl
+*.svg
 test/*.png
-!test/getstr.png   # README 引用，必须保留
-test/luac.out      # luac -l -l 副产物
-test/luac.out      # luac -l -l 副产物
+!test/getstr.png
+test/luac.out
+vlua.log
 
-# go build output in tools/
+# Go / visualization tools (built or downloaded locally)
+tools/flamegraph.pl
+tools/pprof
 tools/vlua
-tools/png
 
-# misc
 *.log
 *.o
 *.so
+*.a

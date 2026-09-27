@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"strings"
@@ -28,8 +27,10 @@ type FileData struct {
 }
 
 func main() {
-	input := flag.String("i", "", "input file")
+	input := flag.String("i", "", "input file (.pro)")
 	pprof := flag.String("pprof", "", "gen pprof symbolized-profiles")
+	flame := flag.String("flame", "", "gen flamegraph collapsed stacks file")
+	collapsed := flag.String("collapsed", "", "alias for -flame")
 
 	flag.Parse()
 
@@ -46,11 +47,18 @@ func main() {
 	if *pprof != "" {
 		showpprof(filedata, *pprof)
 	}
+
+	flameOut := *flame
+	if flameOut == "" {
+		flameOut = *collapsed
+	}
+	if flameOut != "" {
+		showcollapsed(filedata, flameOut)
+	}
 }
 
 func parse(filename string) (*FileData, bool) {
-
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		fmt.Printf("ReadFile fail %v\n", err)
 		return nil, false
@@ -151,16 +159,15 @@ func parse(filename string) (*FileData, bool) {
 }
 
 func showpprof(filedata *FileData, filename string) {
-
 	var output []byte
 
 	output = append(output, []byte("--- symbol\n")...)
 	output = append(output, []byte("binary=vLua\n")...)
 
 	for id, str := range filedata.id2str {
-		name := strings.Replace(str, "<", "'", -1)
-		name = strings.Replace(name, ">", "'", -1)
-		name = strings.Replace(name, "\"", "\\\"", -1)
+		name := strings.ReplaceAll(str, "<", "'")
+		name = strings.ReplaceAll(name, ">", "'")
+		name = strings.ReplaceAll(name, "\"", "\\\"")
 		name = strings.ToValidUTF8(name, "?")
 		tmp := fmt.Sprintf("0x%016x %s\n", id+0xFF000000, name)
 		output = append(output, []byte(tmp)...)
@@ -206,4 +213,34 @@ func showpprof(filedata *FileData, filename string) {
 	f.Write(output)
 
 	fmt.Printf("total sample %v\n", total)
+}
+
+func showcollapsed(filedata *FileData, filename string) {
+	var b strings.Builder
+	total := 0
+	for _, cs := range filedata.callstack {
+		var names []string
+		for i := 0; i < len(cs.stacks); i++ {
+			name, ok := filedata.id2str[cs.stacks[i]]
+			if !ok {
+				name = fmt.Sprintf("0x%x", cs.stacks[i])
+			}
+			name = strings.ReplaceAll(name, ";", ":")
+			name = strings.ReplaceAll(name, "\r", "")
+			name = strings.ReplaceAll(name, "\n", " ")
+			name = strings.ToValidUTF8(name, "?")
+			names = append(names, name)
+		}
+		b.WriteString(strings.Join(names, ";"))
+		b.WriteString(fmt.Sprintf(" %d\n", cs.count))
+		total += cs.count
+	}
+
+	err := os.WriteFile(filename, []byte(b.String()), 0644)
+	if err != nil {
+		fmt.Printf("write flame collapsed file fail: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("total collapsed sample %v\n", total)
 }

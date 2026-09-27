@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake golang-go graphviz google-perftools
+
+    - name: Configure CMake
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+
+    - name: Build
+      run: |
+        cmake --build build --config Release -j$(nproc)
+
+    - name: Run Tests
+      run: |
+        ctest --test-dir build --output-on-failure
+
+    - name: Run Example & Test Visualization Tools
+      run: |
+        cd test
+        ../build/lua/lua53 test_getstr.lua
+        cd ../tools
+        ./show.sh ../test

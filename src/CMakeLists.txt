@@ -1,4 +1,9 @@
-project(vlua)
-aux_source_directory(./ vlua_src)
-add_library(vlua SHARED ${vlua_src})
-TARGET_LINK_LIBRARIES(vlua dl pthread)
+add_library(vlua SHARED vlua.cpp)
+target_include_directories(vlua PRIVATE ${LUA_INCLUDE_DIR})
+target_link_libraries(vlua PRIVATE ${CMAKE_DL_LIBS} pthread)
+set_target_properties(vlua PROPERTIES PREFIX "lib" OUTPUT_NAME "vlua")
+
+# Lua symbols are resolved from the host process at load time (require / hookso).
+if(APPLE)
+    set_target_properties(vlua PROPERTIES LINK_FLAGS "-undefined dynamic_lookup")
+endif()
